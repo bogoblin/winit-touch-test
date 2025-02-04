@@ -1,0 +1,28 @@
+[package]
+name = "touch-test-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = { version = "0.29.15", features = ["rwh_05"] }
+wgpu = { version = "23.0.1", features = ["webgl"] }
+console_log = "1.0.0"
+console_error_panic_hook = "0.1.7"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4.30"
+web-sys = { version = "0.3", features = ["Document", "Window", "Element", "Performance"] }
+cgmath = "0.18.0"
+bytemuck = { version = "1.21.0", features = ["derive"] }
+log = "0.4.25"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.profiling]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
