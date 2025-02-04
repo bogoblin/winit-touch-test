@@ -2,14 +2,19 @@ use std::collections::HashMap;
 use std::mem;
 use cgmath::Vector2;
 use wasm_bindgen::prelude::wasm_bindgen;
-use wgpu::{include_wgsl, BufferAddress, CompositeAlphaMode, PresentMode, VertexBufferLayout};
+use wgpu::{include_wgsl, BufferAddress, Color, CompositeAlphaMode, PresentMode, VertexBufferLayout};
 use wgpu::VertexFormat::{Float32, Float32x2};
 use winit::dpi::{PhysicalPosition};
 use winit::event::{ElementState, Force, KeyEvent, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowBuilder};
+use winit::window::{Window, WindowAttributes};
 use log::info;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{Request, RequestInit, RequestMode, Response};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::ser::SerializeMap;
 
 struct State<'a> {
     surface: wgpu::Surface<'a>,
@@ -21,15 +26,51 @@ struct State<'a> {
     render_pipeline: wgpu::RenderPipeline,
 }
 
+#[derive(Debug)]
+struct TouchBox(Touch);
+
+impl Serialize for TouchBox {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer
+    {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("x", &self.0.location.x)?;
+        map.serialize_entry("y", &self.0.location.y)?;
+        map.serialize_entry("id", &self.0.id)?;
+        map.end()
+    }
+}
+
+#[derive(Serialize, Debug)]
+struct Fingers {
+    fingers: HashMap<u64, TouchBox>
+}
+
+impl Fingers {
+    pub(crate) fn remove(&mut self, id: &u64) {
+        self.fingers.remove(id);
+    }
+    pub(crate) fn insert(&mut self, id: u64, finger: Touch) {
+        self.fingers.insert(id, TouchBox(finger));
+    }
+    fn new() -> Self {
+        Self {
+            fingers: Default::default(),
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub async fn run() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     console_log::init().unwrap();
     let event_loop = EventLoop::new().unwrap();
-    let window = WindowBuilder::new()
-        .with_inner_size(PhysicalSize::new(1280, 720))
-        .build(&event_loop).unwrap();
+    let window = event_loop.create_window(
+        WindowAttributes::new()
+            .with_inner_size(PhysicalSize::new(1280, 720))
+    ).unwrap();
 
     use winit::dpi::PhysicalSize;
     let _ = window.request_inner_size(PhysicalSize::new(1024, 1024));
@@ -46,7 +87,7 @@ pub async fn run() {
         .expect("Couldn't append canvas to document body.");
 
     let mut surface_configured = false;
-    let mut fingers: HashMap<u64, Touch> = HashMap::new();
+    let mut fingers: Fingers = Fingers::new();
 
     let mut size = window.inner_size();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -63,7 +104,7 @@ pub async fn run() {
     ).await.unwrap();
 
     let mut required_limits = wgpu::Limits::downlevel_webgl2_defaults();
-    required_limits.max_texture_dimension_2d = 8192;
+    // required_limits.max_texture_dimension_2d = 4096;
     let (device, queue) = adapter.request_device(
         &wgpu::DeviceDescriptor {
             required_features: wgpu::Features::empty(),
@@ -147,7 +188,7 @@ pub async fn run() {
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: config.format,
-                blend: Some(wgpu::BlendState::REPLACE),
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -191,99 +232,109 @@ pub async fn run() {
         render_pipeline,
     };
 
-    event_loop.run(move |event, control_flow| match event {
-        winit::event::Event::WindowEvent {
-            ref event,
-            ..
-        } => {
-            match event {
-                WindowEvent::CloseRequested
-                | WindowEvent::KeyboardInput {
-                    event:
-                    KeyEvent {
-                        state: ElementState::Pressed,
-                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+    event_loop.run(move |event, control_flow| {
+        match event {
+            winit::event::Event::WindowEvent {
+                ref event,
+                ..
+            } => {
+                match event {
+                    WindowEvent::CloseRequested
+                    | WindowEvent::KeyboardInput {
+                        event:
+                        KeyEvent {
+                            state: ElementState::Pressed,
+                            physical_key: PhysicalKey::Code(KeyCode::Escape),
+                            ..
+                        },
                         ..
-                    },
-                    ..
-                } => control_flow.exit(),
-                WindowEvent::Resized(..) => {
-                    surface_configured = true;
-                    let win = web_sys::window().unwrap();
-                    let width = win.inner_width().unwrap().as_f64().unwrap() as u32;
-                    let height = win.inner_height().unwrap().as_f64().unwrap() as u32;
-                    size = PhysicalSize::new(width, height);
-                    state.scale_factor = state.window.scale_factor();
-                    
-                    state.config.width = (width as f64 * state.scale_factor) as u32;
-                    state.config.height = (height as f64 * state.scale_factor) as u32;
-                    state.surface.configure(&state.device, &state.config);
-                }
-                WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                    state.scale_factor = *scale_factor;
-                }
-                WindowEvent::RedrawRequested => {
-                    state.window.request_redraw();
+                    } => control_flow.exit(),
+                    WindowEvent::Resized(..) => {
+                        surface_configured = true;
+                        let win = web_sys::window().unwrap();
+                        let width = win.inner_width().unwrap().as_f64().unwrap() as u32;
+                        let height = win.inner_height().unwrap().as_f64().unwrap() as u32;
+                        size = PhysicalSize::new(width, height);
+                        state.scale_factor = state.window.scale_factor();
 
-                    if !surface_configured {
-                        return;
+                        state.config.width = width;
+                        state.config.height = height;
+                        // state.config.width = (width as f64 * state.scale_factor) as u32;
+                        // state.config.height = (height as f64 * state.scale_factor) as u32;
+                        state.surface.configure(&state.device, &state.config);
                     }
+                    WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        state.scale_factor = *scale_factor;
+                    }
+                    WindowEvent::RedrawRequested => {
+                        state.window.request_redraw();
 
-                    state.queue.write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&fingers_to_buffer(&fingers)));
-                    state.queue.write_buffer(&camera_buffer, 0, bytemuck::cast_slice(&[
-                        CameraInstance {
-                            dimensions: [size.width as f32, size.height as f32],
-                            scale_factor: [state.scale_factor as f32, state.scale_factor as f32],
+                        if !surface_configured {
+                            return;
                         }
-                    ]));
 
-                    let output = state.surface.get_current_texture().unwrap();
-                    let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("Render Encoder"),
-                    });
-                    {
-                        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("Render Pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                    store: wgpu::StoreOp::Store,
-                                }
-                            })],
-                            depth_stencil_attachment: None,
-                            occlusion_query_set: None,
-                            timestamp_writes: None,
+                        state.queue.write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&fingers_to_buffer(&fingers)));
+                        state.queue.write_buffer(&camera_buffer, 0, bytemuck::cast_slice(&[
+                            CameraInstance {
+                                dimensions: [size.width as f32, size.height as f32],
+                                scale_factor: [state.scale_factor as f32, state.scale_factor as f32],
+                            }
+                        ]));
+
+                        let output = state.surface.get_current_texture().unwrap();
+                        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Render Encoder"),
                         });
+                        {
+                            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("Render Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(Color {
+                                            r: 0.0,
+                                            g: 0.2,
+                                            b: 0.4,
+                                            a: 1.0,
+                                        }),
+                                        store: wgpu::StoreOp::Store,
+                                    }
+                                })],
+                                depth_stencil_attachment: None,
+                                occlusion_query_set: None,
+                                timestamp_writes: None,
+                            });
 
-                        render_pass.set_pipeline(&state.render_pipeline);
-                        render_pass.set_bind_group(0, &camera_bind_group, &[]);
-                        render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
-                        render_pass.draw(0..6, 0..MAX_FINGERS);
-                    }
-                    state.queue.submit(std::iter::once(encoder.finish()));
+                            render_pass.set_pipeline(&state.render_pipeline);
+                            render_pass.set_bind_group(0, &camera_bind_group, &[]);
+                            render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
+                            render_pass.draw(0..6, 0..MAX_FINGERS);
+                        }
+                        state.queue.submit(std::iter::once(encoder.finish()));
 
-                    output.present();
-                }
-                WindowEvent::Touch(touch) => {
-                    match touch.phase {
-                        TouchPhase::Started | 
-                        TouchPhase::Moved => {
-                            fingers.insert(touch.id, *touch);
-                        }
-                        TouchPhase::Ended |
-                        TouchPhase::Cancelled => {
-                            fingers.remove(&touch.id);
-                        }
+                        output.present();
                     }
-                    info!("{:?}", fingers);
+                    WindowEvent::Touch(touch) => {
+                        match touch.phase {
+                            TouchPhase::Started |
+                            TouchPhase::Moved => {
+                                fingers.insert(touch.id, *touch);
+                                // send_fingers(&fingers);
+                            }
+                            TouchPhase::Ended |
+                            TouchPhase::Cancelled => {
+                                fingers.remove(&touch.id);
+                            }
+                        }
+                        info!("{:?}", fingers);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-        },
-        _ => {}
+            },
+            _ => {}
+        }
     }).unwrap();
 }
 
@@ -347,15 +398,15 @@ impl TouchInstance {
     }
 }
 
-fn fingers_to_buffer(fingers: &HashMap<u64, Touch>) -> Vec<TouchInstance> {
+fn fingers_to_buffer(fingers: &Fingers) -> Vec<TouchInstance> {
     let mut result = vec![];
     result.resize_with(10, || {
         TouchInstance::empty()
     });
 
     let mut index = 0;
-    for (_id, finger) in fingers {
-        result[index] = TouchInstance::from_touch(&finger);
+    for (_id, finger) in &fingers.fingers {
+        result[index] = TouchInstance::from_touch(&finger.0);
         index += 1;
     }
 
@@ -368,4 +419,24 @@ fn fingers_to_buffer(fingers: &HashMap<u64, Touch>) -> Vec<TouchInstance> {
 struct CameraInstance {
     dimensions: [f32; 2],
     scale_factor: [f32; 2],
+}
+
+fn send_fingers(fingers: &Fingers) {
+    let opts = RequestInit::new();
+    opts.set_method("GET");
+    opts.set_mode(RequestMode::Cors);
+
+    let url = format!("/log?q={}", serde_json::to_string_pretty(fingers).unwrap_or("couldn't serialize".into()));
+
+    if let Ok(request) = Request::new_with_str_and_init(&url, &opts) {
+        if request
+            .headers()
+            .set("Accept", "application/vnd.github.v3+json")
+            .is_err() {
+            info!("uh oh");
+            return;
+        }
+        let window = web_sys::window().unwrap();
+        let _ = window.fetch_with_request(&request);
+    }
 }

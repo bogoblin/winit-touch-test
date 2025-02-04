@@ -59,9 +59,6 @@ fn screen_to_clip(screen_coords: vec2<f32>) -> vec2<f32> {
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let distance_from_center = length(in.relative_to_center);
-    if distance_from_center < 1.0 {
-        return vec4(0.8, 0.5, 0.0, 1.0);
-    } else {
-        return vec4(0.0, 0.0, 0.0, 1.0);
-    }
+    let distance_from_edge = 1.0 - distance_from_center;
+    return vec4(0.9, 0.9, 0.9, distance_from_edge*10.0);
 }
