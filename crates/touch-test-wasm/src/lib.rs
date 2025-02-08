@@ -1,21 +1,20 @@
-use cgmath::Vector2;
-use serde::Serializer;
 use std::collections::HashMap;
-use std::future::Future;
 use std::mem;
-use std::ops::Deref;
-use std::rc::Rc;
-use std::sync::Arc;
+use cgmath::Vector2;
 use wasm_bindgen::prelude::wasm_bindgen;
-use wasm_bindgen::UnwrapThrowExt;
+use wgpu::{include_wgsl, BufferAddress, Color, CompositeAlphaMode, PresentMode, VertexBufferLayout};
 use wgpu::VertexFormat::{Float32, Float32x2};
-use wgpu::{include_wgsl, BindGroup, Buffer, BufferAddress, Color, CompositeAlphaMode, PresentMode, VertexBufferLayout};
-use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{FingerId, PointerSource, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::window::{Window, WindowAttributes, WindowId};
-use crate::MaybeGraphics::Builder;
+use winit::dpi::{PhysicalPosition};
+use winit::event::{ElementState, Force, KeyEvent, Touch, TouchPhase, WindowEvent};
+use winit::event_loop::EventLoop;
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowAttributes};
+use log::info;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{Request, RequestInit, RequestMode, Response};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::ser::SerializeMap;
 
 struct State<'a> {
     surface: wgpu::Surface<'a>,
@@ -23,352 +22,41 @@ struct State<'a> {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     scale_factor: f64,
+    window: &'a Window,
     render_pipeline: wgpu::RenderPipeline,
-    surface_configured: bool,
-    size: PhysicalSize<u32>,
-    fingers: Fingers,
-    instance_buffer: Buffer,
-    camera_buffer: Buffer,
-    camera_bind_group: BindGroup,
-    window: Arc<Box<dyn Window>>
 }
 
 #[derive(Debug)]
+struct TouchBox(Touch);
+
+impl Serialize for TouchBox {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer
+    {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("x", &self.0.location.x)?;
+        map.serialize_entry("y", &self.0.location.y)?;
+        map.serialize_entry("id", &self.0.id)?;
+        map.end()
+    }
+}
+
+#[derive(Serialize, Debug)]
 struct Fingers {
-    fingers: HashMap<FingerId, PhysicalPosition<f64>>
+    fingers: HashMap<u64, TouchBox>
 }
 
 impl Fingers {
-    pub(crate) fn remove(&mut self, id: &FingerId) {
+    pub(crate) fn remove(&mut self, id: &u64) {
         self.fingers.remove(id);
     }
-    pub(crate) fn insert(&mut self, id: FingerId, position: PhysicalPosition<f64>) {
-        self.fingers.insert(id, position);
+    pub(crate) fn insert(&mut self, id: u64, finger: Touch) {
+        self.fingers.insert(id, TouchBox(finger));
     }
     fn new() -> Self {
         Self {
             fingers: Default::default(),
-        }
-    }
-}
-
-struct GraphicsBuilder {
-    event_loop_proxy: Option<EventLoopProxy>,
-}
-
-impl GraphicsBuilder {
-    fn new(event_loop_proxy: EventLoopProxy) -> Self {
-        Self {
-            event_loop_proxy: Some(event_loop_proxy),
-        }
-    }
-
-    fn build_and_send(&mut self, event_loop: &dyn ActiveEventLoop) {
-        let Some(event_loop_proxy) = self.event_loop_proxy.take() else {
-            // event_loop_proxy is already spent - we already constructed Graphics
-            return;
-        };
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            let gfx_fut = State::new(event_loop);
-            wasm_bindgen_futures::spawn_local(async move {
-                let gfx = gfx_fut.await;
-                assert!(event_loop_proxy.send_event(gfx).is_ok());
-            });
-        }
-    }
-}
-
-enum MaybeGraphics<'a> {
-    Builder(GraphicsBuilder),
-    Graphics(State<'a>),
-}
-
-struct App<'a> {
-    window: Option<Box<dyn Window>>,
-    state: MaybeGraphics<'a>
-}
-
-impl<'a> App<'a> {
-    pub fn new(event_loop: &EventLoop) -> Self {
-        Self {
-            window: None,
-            state: Builder(GraphicsBuilder::new(event_loop.create_proxy()))
-        }
-    }
-}
-
-impl<'a> ApplicationHandler for App<'a> {
-    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
-
-    }
-
-    fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
-        match &mut self.state {
-            Builder(_) => {}
-            MaybeGraphics::Graphics(state) => {
-                state.handle_window_event(event);
-            }
-        }
-    }
-}
-
-impl<'a> State<'a> {
-    const MAX_FINGERS: u32 = 10;
-
-    pub fn new(event_loop: &dyn ActiveEventLoop) -> impl Future<Output = Self> + 'static {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::GL,
-            ..Default::default()
-        });
-
-        let window = Arc::new(event_loop.create_window(
-            WindowAttributes::default()
-                .with_surface_size(PhysicalSize::new(1280, 720))
-        ).unwrap_throw());
-
-        let surface = instance.create_surface(window.clone()).unwrap();
-        async move {
-            let adapter = instance.request_adapter(
-                &wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    compatible_surface: Some(&surface),
-                    force_fallback_adapter: false,
-                },
-            ).await.unwrap();
-
-            let required_limits = wgpu::Limits::downlevel_webgl2_defaults();
-            // required_limits.max_texture_dimension_2d = 4096;
-            let (device, queue) = adapter.request_device(
-                &wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::empty(),
-                    required_limits,
-                    label: None,
-                    memory_hints: Default::default(),
-                },
-                None,
-            ).await.unwrap();
-
-            let surface_caps = surface.get_capabilities(&adapter);
-            let surface_format = surface_caps.formats.iter()
-                .find(|f| f.is_srgb())
-                .copied()
-                .unwrap_or(surface_caps.formats[0]);
-            let config = wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format: surface_format,
-                width: 512,
-                height: 512,
-                present_mode: PresentMode::AutoVsync,
-                alpha_mode: CompositeAlphaMode::Auto,
-                view_formats: vec![],
-                desired_maximum_frame_latency: 1,
-            };
-
-            let camera_buffer = device.create_buffer(
-                &wgpu::BufferDescriptor {
-                    label: Some("camera_buffer"),
-                    size: mem::size_of::<CameraInstance>() as BufferAddress,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }
-            );
-            let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: None,
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    }
-                ],
-            });
-            let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &camera_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: camera_buffer.as_entire_binding(),
-                    }
-                ],
-            });
-
-            let shader = device.create_shader_module(include_wgsl!("touch.wgsl"));
-            let render_pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Render Pipeline Layout"),
-                    bind_group_layouts: &[
-                        &camera_bind_group_layout,
-                    ],
-                    push_constant_ranges: &[],
-                });
-            let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Render Pipeline"),
-                layout: Some(&render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[TouchInstance::desc()],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-                cache: None,
-            });
-
-            let instance_buffer = device.create_buffer(
-                &wgpu::BufferDescriptor {
-                    label: None,
-                    size: (State::MAX_FINGERS as usize * mem::size_of::<TouchInstance>()) as BufferAddress,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }
-            );
-
-            #[cfg(target_arch = "wasm32")]
-            {
-                use winit::platform::web::WindowExtWeb;
-                web_sys::window()
-                    .and_then(|win| win.document())
-                    .and_then(|doc| {
-                        let dst = doc.get_element_by_id("wasm-example").unwrap();
-                        let canvas = web_sys::Element::from(window.canvas().unwrap().clone());
-                        dst.append_child(&canvas).ok().unwrap();
-                        Some(())
-                    })
-                    .expect("Couldn't append canvas to document body.");
-            }
-
-            State {
-                surface,
-                device,
-                queue,
-                config,
-                scale_factor: 1.0,
-                render_pipeline,
-                surface_configured: false,
-                size: Default::default(),
-                fingers: Fingers::new(),
-                instance_buffer,
-                camera_buffer,
-                camera_bind_group,
-                window,
-            }
-        }
-    }
-
-    fn handle_window_event(&mut self, event: WindowEvent) {
-        match event {
-            WindowEvent::SurfaceResized(..) => {
-                {
-                    let win = web_sys::window().unwrap();
-                    let width = win.inner_width().unwrap().as_f64().unwrap() as u32;
-                    let height = win.inner_height().unwrap().as_f64().unwrap() as u32;
-                    self.size = PhysicalSize::new(width, height);
-                    self.scale_factor = self.scale_factor;
-
-                    self.config.width = width;
-                    self.config.height = height;
-                    // self.config.width = (width as f64 * self.scale_factor) as u32;
-                    // self.config.height = (height as f64 * self.scale_factor) as u32;
-                    self.surface.configure(&self.device, &self.config);
-                    self.surface_configured = true;
-                }
-            }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.scale_factor = scale_factor;
-            }
-            WindowEvent::RedrawRequested => {
-                self.window.request_redraw();
-                
-                if !self.surface_configured {
-                    return;
-                }
-
-                self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&fingers_to_buffer(&self.fingers)));
-                self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[
-                    CameraInstance {
-                        dimensions: [self.size.width as f32, self.size.height as f32],
-                        scale_factor: [self.scale_factor as f32, self.scale_factor as f32],
-                    }
-                ]));
-
-                let output = self.surface.get_current_texture().unwrap();
-                let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-                let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Render Encoder"),
-                });
-                {
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Render Pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(Color {
-                                    r: 0.0,
-                                    g: 0.2,
-                                    b: 0.4,
-                                    a: 1.0,
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            }
-                        })],
-                        depth_stencil_attachment: None,
-                        occlusion_query_set: None,
-                        timestamp_writes: None,
-                    });
-
-                    render_pass.set_pipeline(&self.render_pipeline);
-                    render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                    render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-                    render_pass.draw(0..6, 0..Self::MAX_FINGERS);
-                }
-                self.queue.submit(std::iter::once(encoder.finish()));
-
-                output.present();
-            }
-            WindowEvent::PointerMoved{ device_id, position, primary, source } => {
-                match source {
-                    PointerSource::Mouse => {}
-                    PointerSource::Touch { finger_id, force } => {
-                        self.fingers.insert(finger_id, position);
-                    }
-                    PointerSource::Unknown => {}
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -379,10 +67,275 @@ pub async fn run() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     console_log::init().unwrap();
     let event_loop = EventLoop::new().unwrap();
+    let window = event_loop.create_window(
+        WindowAttributes::new()
+            .with_inner_size(PhysicalSize::new(1280, 720))
+    ).unwrap();
 
-    use winit::platform::web::EventLoopExtWeb;
-    let app = App::new(&event_loop);
-    event_loop.spawn_app(app);
+    use winit::dpi::PhysicalSize;
+    let _ = window.request_inner_size(PhysicalSize::new(1024, 1024));
+
+    use winit::platform::web::WindowExtWebSys;
+    web_sys::window()
+        .and_then(|win| win.document())
+        .and_then(|doc| {
+            let dst = doc.get_element_by_id("wasm-example")?;
+            let canvas = web_sys::Element::from(window.canvas()?);
+            dst.append_child(&canvas).ok()?;
+            Some(())
+        })
+        .expect("Couldn't append canvas to document body.");
+
+    let mut surface_configured = false;
+    let mut fingers: Fingers = Fingers::new();
+
+    let mut size = window.inner_size();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::GL,
+        ..Default::default()
+    });
+    let surface = instance.create_surface(&window).unwrap();
+    let adapter = instance.request_adapter(
+        &wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        },
+    ).await.unwrap();
+
+    let mut required_limits = wgpu::Limits::downlevel_webgl2_defaults();
+    // required_limits.max_texture_dimension_2d = 4096;
+    let (device, queue) = adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::empty(),
+            required_limits,
+            label: None,
+            memory_hints: Default::default(),
+        },
+        None,
+    ).await.unwrap();
+
+    let surface_caps = surface.get_capabilities(&adapter);
+    let surface_format = surface_caps.formats.iter()
+        .find(|f| f.is_srgb())
+        .copied()
+        .unwrap_or(surface_caps.formats[0]);
+    let mut config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: surface_format,
+        width: size.width,
+        height: size.height,
+        present_mode: PresentMode::AutoVsync,
+        alpha_mode: CompositeAlphaMode::Auto,
+        view_formats: vec![],
+        desired_maximum_frame_latency: 1,
+    };
+
+    let camera_buffer = device.create_buffer(
+        &wgpu::BufferDescriptor {
+            label: Some("camera_buffer"),
+            size: mem::size_of::<CameraInstance>() as BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }
+    );
+    let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }
+        ],
+    });
+    let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &camera_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }
+        ],
+    });
+
+    let shader = device.create_shader_module(include_wgsl!("touch.wgsl"));
+    let render_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[
+                &camera_bind_group_layout,
+            ],
+            push_constant_ranges: &[],
+        });
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Render Pipeline"),
+        layout: Some(&render_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[TouchInstance::desc()],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+        cache: None,
+    });
+
+    const MAX_FINGERS: u32 = 10;
+    let instance_buffer = device.create_buffer(
+        &wgpu::BufferDescriptor {
+            label: None,
+            size: (MAX_FINGERS as usize * mem::size_of::<TouchInstance>()) as BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }
+    );
+
+    let mut state = State {
+        surface,
+        device,
+        queue,
+        config,
+        scale_factor: 1.0,
+        window: &window,
+        render_pipeline,
+    };
+
+    event_loop.run(move |event, control_flow| {
+        match event {
+            winit::event::Event::WindowEvent {
+                ref event,
+                ..
+            } => {
+                match event {
+                    WindowEvent::CloseRequested
+                    | WindowEvent::KeyboardInput {
+                        event:
+                        KeyEvent {
+                            state: ElementState::Pressed,
+                            physical_key: PhysicalKey::Code(KeyCode::Escape),
+                            ..
+                        },
+                        ..
+                    } => control_flow.exit(),
+                    WindowEvent::Resized(..) => {
+                        surface_configured = true;
+                        let win = web_sys::window().unwrap();
+                        let width = win.inner_width().unwrap().as_f64().unwrap() as u32;
+                        let height = win.inner_height().unwrap().as_f64().unwrap() as u32;
+                        size = PhysicalSize::new(width, height);
+                        state.scale_factor = state.window.scale_factor();
+
+                        state.config.width = width;
+                        state.config.height = height;
+                        // state.config.width = (width as f64 * state.scale_factor) as u32;
+                        // state.config.height = (height as f64 * state.scale_factor) as u32;
+                        state.surface.configure(&state.device, &state.config);
+                    }
+                    WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        state.scale_factor = *scale_factor;
+                    }
+                    WindowEvent::RedrawRequested => {
+                        state.window.request_redraw();
+
+                        if !surface_configured {
+                            return;
+                        }
+
+                        state.queue.write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&fingers_to_buffer(&fingers)));
+                        state.queue.write_buffer(&camera_buffer, 0, bytemuck::cast_slice(&[
+                            CameraInstance {
+                                dimensions: [size.width as f32, size.height as f32],
+                                scale_factor: [state.scale_factor as f32, state.scale_factor as f32],
+                            }
+                        ]));
+
+                        let output = state.surface.get_current_texture().unwrap();
+                        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Render Encoder"),
+                        });
+                        {
+                            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("Render Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(Color {
+                                            r: 0.0,
+                                            g: 0.2,
+                                            b: 0.4,
+                                            a: 1.0,
+                                        }),
+                                        store: wgpu::StoreOp::Store,
+                                    }
+                                })],
+                                depth_stencil_attachment: None,
+                                occlusion_query_set: None,
+                                timestamp_writes: None,
+                            });
+
+                            render_pass.set_pipeline(&state.render_pipeline);
+                            render_pass.set_bind_group(0, &camera_bind_group, &[]);
+                            render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
+                            render_pass.draw(0..6, 0..MAX_FINGERS);
+                        }
+                        state.queue.submit(std::iter::once(encoder.finish()));
+
+                        output.present();
+                    }
+                    WindowEvent::Touch(touch) => {
+                        match touch.phase {
+                            TouchPhase::Started |
+                            TouchPhase::Moved => {
+                                fingers.insert(touch.id, *touch);
+                                // send_fingers(&fingers);
+                            }
+                            TouchPhase::Ended |
+                            TouchPhase::Cancelled => {
+                                fingers.remove(&touch.id);
+                            }
+                        }
+                        info!("{:?}", fingers);
+                    }
+                    _ => {}
+                }
+            },
+            _ => {}
+        }
+    }).unwrap();
 }
 
 fn physical_to_vector(position: &PhysicalPosition<f64>) -> Vector2<f64> {
@@ -409,9 +362,9 @@ impl TouchInstance {
 }
 
 impl TouchInstance {
-    pub fn from_touch(location: PhysicalPosition<f64>) -> Self {
-        let position = [location.x as f32, location.y as f32];
-        let force = 0.0; // todo: maybe we need force later
+    pub fn from_touch(touch: &Touch) -> Self {
+        let position = [touch.location.x as f32, touch.location.y as f32];
+        let force = touch.force.unwrap_or(Force::Normalized(0.0)).normalized() as f32;
         let scale = 100.0;
         Self {
             position,
@@ -453,7 +406,7 @@ fn fingers_to_buffer(fingers: &Fingers) -> Vec<TouchInstance> {
 
     let mut index = 0;
     for (_id, finger) in &fingers.fingers {
-        result[index] = TouchInstance::from_touch(finger.clone());
+        result[index] = TouchInstance::from_touch(&finger.0);
         index += 1;
     }
 
@@ -466,4 +419,24 @@ fn fingers_to_buffer(fingers: &Fingers) -> Vec<TouchInstance> {
 struct CameraInstance {
     dimensions: [f32; 2],
     scale_factor: [f32; 2],
+}
+
+fn send_fingers(fingers: &Fingers) {
+    let opts = RequestInit::new();
+    opts.set_method("GET");
+    opts.set_mode(RequestMode::Cors);
+
+    let url = format!("/log?q={}", serde_json::to_string_pretty(fingers).unwrap_or("couldn't serialize".into()));
+
+    if let Ok(request) = Request::new_with_str_and_init(&url, &opts) {
+        if request
+            .headers()
+            .set("Accept", "application/vnd.github.v3+json")
+            .is_err() {
+            info!("uh oh");
+            return;
+        }
+        let window = web_sys::window().unwrap();
+        let _ = window.fetch_with_request(&request);
+    }
 }
