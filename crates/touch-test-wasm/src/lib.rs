@@ -1,20 +1,24 @@
+use cgmath::Vector2;
+use serde::Serializer;
 use std::collections::HashMap;
 use std::future::Future;
 use std::mem;
+use std::ops::Deref;
+use std::rc::Rc;
 use std::sync::Arc;
-use log::info;
-use log::Level::Debug;
 use wasm_bindgen::prelude::wasm_bindgen;
+use wasm_bindgen::UnwrapThrowExt;
 use wgpu::VertexFormat::{Float32, Float32x2};
 use wgpu::{include_wgsl, BindGroup, Buffer, BufferAddress, Color, CompositeAlphaMode, PresentMode, VertexBufferLayout};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{FingerId, PointerKind, PointerSource, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event::{FingerId, PointerSource, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
+use crate::MaybeGraphics::Builder;
 
-struct State {
-    surface: wgpu::Surface<'static>,
+struct State<'a> {
+    surface: wgpu::Surface<'a>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -26,7 +30,7 @@ struct State {
     instance_buffer: Buffer,
     camera_buffer: Buffer,
     camera_bind_group: BindGroup,
-    window: Arc<Box<dyn Window>>,
+    window: Arc<Box<dyn Window>>
 }
 
 #[derive(Debug)]
@@ -48,63 +52,81 @@ impl Fingers {
     }
 }
 
-struct App {
-    window: Option<Arc<Box<dyn Window>>>,
-    state: Option<State>,
-    receiver: Option<futures::channel::oneshot::Receiver<State>>,
+struct GraphicsBuilder {
+    event_loop_proxy: Option<EventLoopProxy>,
 }
 
-impl App {
-    pub fn new() -> Self {
+impl GraphicsBuilder {
+    fn new(event_loop_proxy: EventLoopProxy) -> Self {
         Self {
-            window: None,
-            state: None,
-            receiver: None,
+            event_loop_proxy: Some(event_loop_proxy),
         }
     }
-}
 
-impl ApplicationHandler for App {
-    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
-        if let Ok(window) = event_loop.create_window(
-            WindowAttributes::default()
-                .with_surface_size(PhysicalSize::new(1280, 720))
-        ) {
-            let window_handle = Arc::new(window);
-            self.window = Some(window_handle.clone());
-            let (sender, receiver) = futures::channel::oneshot::channel();
-            self.receiver = Some(receiver);
+    fn build_and_send(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let Some(event_loop_proxy) = self.event_loop_proxy.take() else {
+            // event_loop_proxy is already spent - we already constructed Graphics
+            return;
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let gfx_fut = State::new(event_loop);
             wasm_bindgen_futures::spawn_local(async move {
-                let state = State::new(window_handle.clone()).await;
-                let _ = sender.send(state);
+                let gfx = gfx_fut.await;
+                assert!(event_loop_proxy.send_event(gfx).is_ok());
             });
         }
     }
+}
 
-    fn window_event(&mut self, _event_loop: &dyn ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
-        if self.state.is_none() {
-            if let Some(receiver) = &mut self.receiver {
-                if let Ok(Some(mut state)) = receiver.try_recv() {
-                    state.resize();
-                    info!("resized");
-                    self.state = Some(state);
-                }
-            }
-        }
-        if let Some(state) = &mut self.state {
-            state.handle_window_event(event);
+enum MaybeGraphics<'a> {
+    Builder(GraphicsBuilder),
+    Graphics(State<'a>),
+}
+
+struct App<'a> {
+    window: Option<Box<dyn Window>>,
+    state: MaybeGraphics<'a>
+}
+
+impl<'a> App<'a> {
+    pub fn new(event_loop: &EventLoop) -> Self {
+        Self {
+            window: None,
+            state: Builder(GraphicsBuilder::new(event_loop.create_proxy()))
         }
     }
 }
 
-impl State {
+impl<'a> ApplicationHandler for App<'a> {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+
+    }
+
+    fn window_event(&mut self, event_loop: &dyn ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+        match &mut self.state {
+            Builder(_) => {}
+            MaybeGraphics::Graphics(state) => {
+                state.handle_window_event(event);
+            }
+        }
+    }
+}
+
+impl<'a> State<'a> {
     const MAX_FINGERS: u32 = 10;
 
-    pub fn new(window: Arc<Box<dyn Window>>) -> impl Future<Output = Self> + 'static {
+    pub fn new(event_loop: &dyn ActiveEventLoop) -> impl Future<Output = Self> + 'static {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::GL,
             ..Default::default()
         });
+
+        let window = Arc::new(event_loop.create_window(
+            WindowAttributes::default()
+                .with_surface_size(PhysicalSize::new(1280, 720))
+        ).unwrap_throw());
 
         let surface = instance.create_surface(window.clone()).unwrap();
         async move {
@@ -116,8 +138,8 @@ impl State {
                 },
             ).await.unwrap();
 
-            let mut required_limits = wgpu::Limits::downlevel_webgl2_defaults();
-            required_limits.max_texture_dimension_2d = 4096;
+            let required_limits = wgpu::Limits::downlevel_webgl2_defaults();
+            // required_limits.max_texture_dimension_2d = 4096;
             let (device, queue) = adapter.request_device(
                 &wgpu::DeviceDescriptor {
                     required_features: wgpu::Features::empty(),
@@ -136,8 +158,8 @@ impl State {
             let config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: surface_format,
-                width: window.surface_size().width,
-                height: window.surface_size().height,
+                width: 512,
+                height: 512,
                 present_mode: PresentMode::AutoVsync,
                 alpha_mode: CompositeAlphaMode::Auto,
                 view_formats: vec![],
@@ -266,23 +288,23 @@ impl State {
         }
     }
 
-    fn resize(&mut self) {
-        let win = web_sys::window().unwrap();
-        let width = win.inner_width().unwrap().as_f64().unwrap() as u32;
-        let height = win.inner_height().unwrap().as_f64().unwrap() as u32;
-        self.size = PhysicalSize::new(width, height);
-        self.scale_factor = self.window.scale_factor();
-        self.config.width = (width as f64 * self.scale_factor) as u32;
-        self.config.height = (height as f64 * self.scale_factor) as u32;
-        info!("{} x {} at {}", width, height, self.scale_factor);
-        self.surface.configure(&self.device, &self.config);
-        self.surface_configured = true;
-    }
-
     fn handle_window_event(&mut self, event: WindowEvent) {
         match event {
             WindowEvent::SurfaceResized(..) => {
-                self.resize();
+                {
+                    let win = web_sys::window().unwrap();
+                    let width = win.inner_width().unwrap().as_f64().unwrap() as u32;
+                    let height = win.inner_height().unwrap().as_f64().unwrap() as u32;
+                    self.size = PhysicalSize::new(width, height);
+                    self.scale_factor = self.scale_factor;
+
+                    self.config.width = width;
+                    self.config.height = height;
+                    // self.config.width = (width as f64 * self.scale_factor) as u32;
+                    // self.config.height = (height as f64 * self.scale_factor) as u32;
+                    self.surface.configure(&self.device, &self.config);
+                    self.surface_configured = true;
+                }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale_factor = scale_factor;
@@ -337,23 +359,13 @@ impl State {
 
                 output.present();
             }
-            WindowEvent::PointerMoved { position, source, .. } => {
+            WindowEvent::PointerMoved{ device_id, position, primary, source } => {
                 match source {
                     PointerSource::Mouse => {}
-                    PointerSource::Touch { finger_id, .. } => {
+                    PointerSource::Touch { finger_id, force } => {
                         self.fingers.insert(finger_id, position);
-                        info!("{:?}", self.fingers);
                     }
                     PointerSource::Unknown => {}
-                }
-            }
-            WindowEvent::PointerLeft { kind, .. } => {
-                match kind {
-                    PointerKind::Mouse => {}
-                    PointerKind::Touch(finger_id) => {
-                        self.fingers.remove(&finger_id);
-                    }
-                    PointerKind::Unknown => {}
                 }
             }
             _ => {}
@@ -366,12 +378,15 @@ impl State {
 pub async fn run() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     console_log::init().unwrap();
-    info!("asdfasdfasdf");
     let event_loop = EventLoop::new().unwrap();
 
     use winit::platform::web::EventLoopExtWeb;
-    let app = App::new();
+    let app = App::new(&event_loop);
     event_loop.spawn_app(app);
+}
+
+fn physical_to_vector(position: &PhysicalPosition<f64>) -> Vector2<f64> {
+    Vector2::new(position.x, position.y)
 }
 
 #[repr(C)]
