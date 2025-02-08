@@ -3,6 +3,7 @@ use std::future::Future;
 use std::mem;
 use std::sync::Arc;
 use log::info;
+use log::Level::Debug;
 use wasm_bindgen::prelude::wasm_bindgen;
 use wgpu::VertexFormat::{Float32, Float32x2};
 use wgpu::{include_wgsl, BindGroup, Buffer, BufferAddress, Color, CompositeAlphaMode, PresentMode, VertexBufferLayout};
